@@ -140,7 +140,7 @@ object ViewHierarchy {
         serializer.attribute("", "password", java.lang.Boolean.toString(node.isPassword))
         serializer.attribute("", "selected", java.lang.Boolean.toString(node.isSelected))
         serializer.attribute("", "visible-to-user", java.lang.Boolean.toString(node.isVisibleToUser))
-        serializer.attribute("", "important-for-accessibility", java.lang.Boolean.toString(node.isImportantForAccessibility))
+        serializer.attribute("", "important-for-accessibility", java.lang.Boolean.toString(if (android.os.Build.VERSION.SDK_INT >= 24) node.isImportantForAccessibility else true))
         serializer.attribute("", "error", safeCharSeqToString(node.error))
         serializer.attribute(
             "", "bounds", getVisibleBoundsInScreen(node, displayRect)?.toShortString()
