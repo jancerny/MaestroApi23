@@ -66,9 +66,11 @@ class AndroidDeviceConnectionTest {
         var onPullSink: (Sink, String) -> DadbSyncResult = { _, _ -> error("pull(Sink) not stubbed") },
         var onPush: (File, String) -> DadbSyncResult = { _, _ -> error("push not stubbed") },
         var onOpen: (String) -> AdbStream = { error("open not stubbed") },
+        // null = a modern device that supports everything; a set = only these adbd features.
+        var features: Set<String>? = null,
     ) : Dadb {
         override fun open(destination: String): AdbStream = onOpen(destination)
-        override fun supportsFeature(feature: String): Boolean = true
+        override fun supportsFeature(feature: String): Boolean = features?.contains(feature) ?: true
         override fun shell(command: String): AdbShellResponse = onShell(command)
         override fun install(file: File, vararg options: String): DadbInstallResult = onInstall(file)
         override fun uninstall(packageName: String): DadbUninstallResult = onUninstall(packageName)
@@ -254,6 +256,106 @@ class AndroidDeviceConnectionTest {
     fun `pull(File) throws DeviceAuth on AdbAuthException`() {
         val c = conn(FakeDadb(onPullFile = { _, _ -> throw AdbAuthException("A_AUTH rejected") }), alive = true)
         assertThrows<DeviceAuthException> { c.pull(apk(), "/sdcard/x") }
+    }
+
+    // ── legacy adbd (Android < 7): no shell_v2, no `cmd` ──────────────────────────
+
+    /** A raw `shell:` stream that replays [output] and records whether it was closed. */
+    private class FakeStream(output: String) : AdbStream {
+        override val source: BufferedSource = Buffer().writeUtf8(output)
+        override val sink: BufferedSink = Buffer()
+        var closed = false
+        override fun close() { closed = true }
+    }
+
+    private fun legacyDadb(
+        opened: MutableList<String> = mutableListOf(),
+        onPush: (File, String) -> DadbSyncResult = { _, _ -> DadbSyncResult.Success },
+        reply: (String) -> String,
+    ) = FakeDadb(
+        features = emptySet(),
+        onOpen = { destination -> opened += destination; FakeStream(reply(destination)) },
+        onPush = onPush,
+        onShell = { error("legacy device must not use shell_v2") },
+        onInstall = { error("legacy device must not use dadb.install") },
+        onUninstall = { error("legacy device must not use dadb.uninstall (it runs `cmd`)") },
+    )
+
+    @Test
+    fun `legacy shell recovers the exit code from the sentinel and normalises CRLF`() {
+        val opened = mutableListOf<String>()
+        val c = conn(legacyDadb(opened) { "hello\r\nworld\r\n__MAESTRO_RC__=3\r\n" })
+        val response = c.shell("do something")
+        assertThat(response.exitCode).isEqualTo(3)
+        assertThat(response.output).isEqualTo("hello\nworld\n")
+        assertThat(opened.single()).startsWith("shell:do something ;")
+    }
+
+    @Test
+    fun `legacy shell without a sentinel reports failure instead of success`() {
+        val c = conn(legacyDadb { "partial output" })
+        assertThat(c.shell("ls").exitCode).isEqualTo(1)
+    }
+
+    @Test
+    fun `legacy shell transport death still throws DeviceUnreachable`() {
+        val c = conn(
+            FakeDadb(features = emptySet(), onOpen = { throw AdbConnectionClosedException("socket reset") }),
+            alive = true,
+        )
+        assertThrows<DeviceUnreachableException> { c.shell("ls") }
+    }
+
+    @Test
+    fun `legacy uninstall uses pm instead of cmd`() {
+        val opened = mutableListOf<String>()
+        val c = conn(legacyDadb(opened) { "Success\r\n__MAESTRO_RC__=0\r\n" })
+        assertThat(c.uninstall("dev.mobile.maestro")).isEqualTo(UninstallResult.Success)
+        assertThat(opened.single()).contains("pm uninstall dev.mobile.maestro")
+    }
+
+    @Test
+    fun `legacy uninstall of a missing package is a Failure`() {
+        val c = conn(legacyDadb { "Failure\r\n__MAESTRO_RC__=0\r\n" })
+        assertThat(c.uninstall("com.x")).isInstanceOf(UninstallResult.Failure::class.java)
+    }
+
+    @Test
+    fun `legacy install pushes the apk, runs pm install and cleans up`() {
+        val opened = mutableListOf<String>()
+        val pushed = mutableListOf<String>()
+        val file = apk()
+        val c = conn(legacyDadb(opened, onPush = { _, remote -> pushed += remote; DadbSyncResult.Success }) { destination ->
+            if (destination.contains("pm install")) "\tpkg: /data/local/tmp/x\r\nSuccess\r\n__MAESTRO_RC__=0\r\n"
+            else "__MAESTRO_RC__=0\r\n"
+        })
+        assertThat(c.install(file)).isEqualTo(InstallResult.Success)
+        assertThat(pushed.single()).isEqualTo("/data/local/tmp/${file.name}")
+        assertThat(opened[0]).contains("pm install -r \"/data/local/tmp/${file.name}\"")
+        assertThat(opened[1]).contains("rm -f \"/data/local/tmp/${file.name}\"")
+    }
+
+    @Test
+    fun `legacy install reports the pm failure reason`() {
+        val c = conn(legacyDadb { destination ->
+            if (destination.contains("pm install")) "Failure [INSTALL_FAILED_OLDER_SDK]\r\n__MAESTRO_RC__=0\r\n"
+            else "__MAESTRO_RC__=0\r\n"
+        })
+        val result = c.install(apk())
+        assertThat(result).isInstanceOf(InstallResult.Failure::class.java)
+        assertThat((result as InstallResult.Failure).message).contains("INSTALL_FAILED_OLDER_SDK")
+    }
+
+    @Test
+    fun `legacy instrumentation runs in the foreground and closing the session closes the stream`() {
+        val opened = mutableListOf<String>()
+        val streams = mutableListOf<FakeStream>()
+        val c = conn(FakeDadb(features = emptySet(), onOpen = { d -> opened += d; FakeStream("").also { streams += it } }))
+        val session = c.startInstrumentation("am instrument -w -e port 7001 dev.mobile.maestro.test/runner &\n")
+        assertThat(session.startedSuccessfully()).isTrue()
+        assertThat(opened.single()).isEqualTo("shell:am instrument -w -e port 7001 dev.mobile.maestro.test/runner")
+        session.close()
+        assertThat(streams.single().closed).isTrue()
     }
 
     // ── ancillary transport ops: open / openShell carry no operation outcome, only deaths ──

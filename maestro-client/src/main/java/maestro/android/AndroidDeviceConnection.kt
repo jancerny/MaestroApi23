@@ -75,6 +75,9 @@ class AndroidDeviceConnection private constructor(
     /** adbd / adb-server endpoint used by the liveness probe. */
     data class Endpoint(val host: String, val port: Int)
 
+    // Android < 7 (API < 24) adbd has no shell_v2 service and no `cmd` binary.
+    private val legacyShell: Boolean by lazy { !dadb.supportsFeature("shell_v2") }
+
     @Volatile
     var state: ConnectionState = ConnectionState.CONNECTED
         private set
@@ -150,17 +153,34 @@ class AndroidDeviceConnection private constructor(
     fun shell(command: String): AdbShellResponse =
         try {
             // A non-zero exit code rides home inside AdbShellResponse; only a transport death throws.
-            dadb.shell(command).also { lastByteNanos = nanoNow() }
+            (if (legacyShell) legacyShellExec(command) else dadb.shell(command)).also { lastByteNanos = nanoNow() }
         } catch (e: AdbException) {
             throw mapTransport("shell: $command", e)
         }
 
+    /**
+     * Legacy `shell:` service: stdout and stderr arrive merged, through a pty (CRLF line endings), with
+     * no exit status. Append a sentinel carrying `$?` and split it back out.
+     */
+    private fun legacyShellExec(command: String): AdbShellResponse {
+        val raw = dadb.open("shell:$command ; echo \"$LEGACY_RC_MARKER\$?\"").use { it.source.readUtf8() }
+            .replace("\r\n", "\n")
+        val idx = raw.lastIndexOf(LEGACY_RC_MARKER)
+        if (idx < 0) return AdbShellResponse(raw, "", 1)
+        val exitCode = raw.substring(idx + LEGACY_RC_MARKER.length).trim().toIntOrNull() ?: 1
+        return AdbShellResponse(raw.substring(0, idx), "", exitCode)
+    }
+
     fun install(apk: File): InstallResult =
         try {
             // Operation outcome is the RETURNED result; only a transport AdbException is a device death.
-            when (val r = dadb.install(apk)) {
-                is DadbInstallResult.Success -> InstallResult.Success
-                is DadbInstallResult.Failure -> InstallResult.Failure(r.reason)
+            if (legacyShell) {
+                legacyInstall(apk)
+            } else {
+                when (val r = dadb.install(apk)) {
+                    is DadbInstallResult.Success -> InstallResult.Success
+                    is DadbInstallResult.Failure -> InstallResult.Failure(r.reason)
+                }
             }.also { lastByteNanos = nanoNow() }
         } catch (e: AdbException) {
             throw mapTransport("install: ${apk.name}", e)
@@ -168,13 +188,30 @@ class AndroidDeviceConnection private constructor(
 
     fun uninstall(packageName: String): UninstallResult =
         try {
-            when (val r = dadb.uninstall(packageName)) {
-                is DadbUninstallResult.Success -> UninstallResult.Success
-                is DadbUninstallResult.Failure -> UninstallResult.Failure("${r.reason} (exit ${r.exitCode})")
+            if (legacyShell) {
+                val r = legacyShellExec("pm uninstall $packageName")
+                if (r.output.contains("Success")) UninstallResult.Success
+                else UninstallResult.Failure("${r.output.trim()} (exit ${r.exitCode})")
+            } else {
+                when (val r = dadb.uninstall(packageName)) {
+                    is DadbUninstallResult.Success -> UninstallResult.Success
+                    is DadbUninstallResult.Failure -> UninstallResult.Failure("${r.reason} (exit ${r.exitCode})")
+                }
             }.also { lastByteNanos = nanoNow() }
         } catch (e: AdbException) {
             throw mapTransport("uninstall: $packageName", e)
         }
+
+    private fun legacyInstall(apk: File): InstallResult {
+        val remote = "/data/local/tmp/${apk.name}"
+        when (val r = dadb.push(apk, remote)) {
+            is DadbSyncResult.Failure -> return InstallResult.Failure(r.reason)
+            is DadbSyncResult.Success -> Unit
+        }
+        val r = legacyShellExec("pm install -r \"$remote\"")
+        legacyShellExec("rm -f \"$remote\"")
+        return if (r.output.contains("Success")) InstallResult.Success else InstallResult.Failure(r.output.trim())
+    }
 
     fun pull(local: File, remote: String): SyncResult =
         try {
@@ -251,7 +288,15 @@ class AndroidDeviceConnection private constructor(
      * connection owns the underlying adb shell stream and never hands it out.
      */
     fun startInstrumentation(command: String): InstrumentationSession =
-        DadbInstrumentationSession(openShell(command, operation = "instrumentation"))
+        if (legacyShell) {
+            // Legacy adbd runs the command on a pty: a backgrounded `am instrument` would get SIGHUP when the
+            // shell exits. Run it in the foreground and hold the stream; close() tears it down.
+            // `am instrument -w` prints nothing until it ends, so readiness is left to awaitLaunch's port probe.
+            val foreground = command.trim().removeSuffix("&").trim()
+            LegacyInstrumentationSession(open("shell:$foreground"))
+        } else {
+            DadbInstrumentationSession(openShell(command, operation = "instrumentation"))
+        }
 
     /**
      * True if the on-device driver gRPC server is accepting connections on [port]. A pure liveness
@@ -263,7 +308,7 @@ class AndroidDeviceConnection private constructor(
 
     /** Start a detached background shell command (e.g. `nohup … &`); does not wait for or expose the stream. */
     fun execDetached(command: String) {
-        openShell(command)
+        if (legacyShell) open("shell:$command") else openShell(command)
     }
 
     /**
@@ -273,6 +318,14 @@ class AndroidDeviceConnection private constructor(
     interface InstrumentationSession : AutoCloseable {
         /** Reads the instrumentation's first output and reports whether it came up cleanly (no stderr/FAILED/UNABLE). */
         fun startedSuccessfully(): Boolean
+    }
+
+    private class LegacyInstrumentationSession(private val stream: AdbStream) : InstrumentationSession {
+        override fun startedSuccessfully(): Boolean = true
+
+        override fun close() {
+            runCatching { stream.close() }
+        }
     }
 
     private class DadbInstrumentationSession(private val stream: AdbShellStream) : InstrumentationSession {
@@ -351,6 +404,7 @@ class AndroidDeviceConnection private constructor(
         private val LOGGER = LoggerFactory.getLogger(AndroidDeviceConnection::class.java)
 
         const val DEFAULT_DRIVER_HOST_PORT = 7001
+        private const val LEGACY_RC_MARKER = "__MAESTRO_RC__="
         private const val DEFAULT_ADB_SERVER_PORT = 5037
         // 1s: a liveness probe must stay quick — better to occasionally misjudge a momentarily-busy
         // adbd as unreachable than to block the failure path. Bounds the connect in probeEndpoint().
