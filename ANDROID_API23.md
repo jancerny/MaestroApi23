@@ -38,6 +38,25 @@ cp maestro-android/build/outputs/apk/androidTest/debug/maestro-android-debug-and
 
 `compileSdk` is 37. If Gradle cannot resolve the `android-37` platform, compile against 36 locally without committing that change. The driver does not use any API 37 feature.
 
-## Rebasing on upstream
+## Syncing with upstream
 
-Upstream commits new driver APKs into `maestro-client/src/main/resources` with every release. On a rebase, those files always conflict. Take either side, then rebuild both APKs from the rebased source as shown above.
+`main` is upstream plus the commits above. Pull upstream changes by merging, not rebasing, so `main` history never gets rewritten:
+
+```
+git remote add upstream https://github.com/mobile-dev-inc/Maestro.git   # once
+git fetch upstream
+git merge upstream/main
+```
+
+GitHub's "Sync fork" button does the same merge, but it can't resolve the conflict below, so use the command line when upstream has touched the driver APKs.
+
+Upstream commits new driver APKs into `maestro-client/src/main/resources` with each release, so a merge usually conflicts on `maestro-app.apk` and `maestro-server.apk`. Take either side, rebuild both APKs from the merged source as shown under Building, then finish the merge:
+
+```
+git checkout --theirs maestro-client/src/main/resources/maestro-app.apk maestro-client/src/main/resources/maestro-server.apk
+# rebuild and copy the two APKs (see Building)
+git add maestro-client/src/main/resources/*.apk
+git commit
+```
+
+Check that the rebuilt APKs still say `sdkVersion:'23'` (`aapt dump badging maestro-client/src/main/resources/maestro-app.apk | grep sdkVersion`). Then run `./gradlew :maestro-client:test --tests 'maestro.android.*'`, which covers the legacy shell path.
