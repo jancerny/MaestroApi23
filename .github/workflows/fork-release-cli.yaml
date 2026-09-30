@@ -1,0 +1,70 @@
+# Fork-only workflow (not in upstream): builds the Android 6 capable CLI and attaches it to a GitHub Release.
+# Push a tag like `2.11.0-api23.1` to publish. Run it manually to build and check without publishing.
+name: Fork release CLI
+
+on:
+  push:
+    tags:
+      - '*-api23.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: github.repository == 'jancerny/MaestroApi23'
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: gradle
+
+      - name: Resolve version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "CLI_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            base=$(grep -w CLI_VERSION maestro-cli/gradle.properties | cut -d'=' -f2)
+            echo "CLI_VERSION=${base}-api23.dev.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check bundled driver APKs target API 23
+        run: |
+          aapt=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt
+          for apk in maestro-client/src/main/resources/maestro-app.apk maestro-client/src/main/resources/maestro-server.apk; do
+            sdk=$("$aapt" dump badging "$apk" | sed -n "s/^sdkVersion:'\([0-9]*\)'/\1/p")
+            echo "$apk minSdk=$sdk"
+            if [ "$sdk" != "23" ]; then
+              echo "::error::$apk has minSdk $sdk, expected 23. Rebuild the driver APKs (see ANDROID_API23.md)."
+              exit 1
+            fi
+          done
+
+      - name: Test adb connection layer
+        run: ./gradlew :maestro-client:test --tests 'maestro.android.*' --no-daemon
+
+      - name: Build CLI zip
+        run: ./gradlew :maestro-cli:distZip -PCLI_VERSION="$CLI_VERSION" --no-daemon
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: maestro-${{ env.CLI_VERSION }}
+          path: maestro-cli/build/distributions/maestro.zip
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$CLI_VERSION" maestro-cli/build/distributions/maestro.zip \
+            --title "Maestro $CLI_VERSION" \
+            --notes "Maestro CLI with Android 6.0 (API 23) support. See ANDROID_API23.md for what changed and how to install."

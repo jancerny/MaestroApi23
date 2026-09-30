@@ -21,6 +21,35 @@ On the stock `system-images;android-23;default;x86_64` emulator image: launch, t
 
 Not verified on Android 6: permissions, `clearState`, location mocking, airplane and night mode (both use `cmd`), screen recording.
 
+## Installing a release
+
+Releases are on the fork's [Releases page](https://github.com/jancerny/MaestroApi23/releases). Java 17 or newer must be on the `PATH`.
+
+```
+curl -fsSL -o /tmp/maestro.zip https://github.com/jancerny/MaestroApi23/releases/latest/download/maestro.zip
+rm -rf ~/.maestro-api23 && mkdir -p ~/.maestro-api23 && unzip -q /tmp/maestro.zip -d ~/.maestro-api23
+export PATH="$HOME/.maestro-api23/maestro/bin:$PATH"
+export MAESTRO_DISABLE_UPDATE_CHECK=true
+maestro --version
+```
+
+To pin a version, replace `latest/download` with `download/<tag>`, for example `download/2.11.0-api23.1`.
+
+Keep `MAESTRO_DISABLE_UPDATE_CHECK=true` set. Otherwise the CLI checks mobile.dev for new releases and suggests the upstream installer, which replaces this build with one that can't run on Android 6. Installing into `~/.maestro-api23` keeps this build apart from an upstream install in `~/.maestro`.
+
+## Publishing a release
+
+`.github/workflows/fork-release-cli.yaml` exists only in this fork. It runs when you push a tag ending in `-api23.<n>`:
+
+```
+git tag 2.11.0-api23.1
+git push origin 2.11.0-api23.1
+```
+
+The tag becomes the CLI version (`maestro --version`). Use the upstream version you last merged, followed by `-api23.<n>`. The tags have no `v` prefix, so upstream's release workflows (which trigger on `v*` and only run in `mobile-dev-inc/maestro`) don't start.
+
+Before building, the workflow checks that both bundled driver APKs declare `minSdk 23` and runs the `maestro.android.*` tests. Running it manually from the Actions tab does the same checks and build and uploads the zip as a workflow artifact, but creates no release.
+
 ## Building
 
 ```
